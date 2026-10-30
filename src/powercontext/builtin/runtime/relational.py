@@ -109,6 +109,7 @@ from powercontext.builtin.artifacts.topic_memory import (
     TopicMemorySearchMode,
     TopicMemorySearchResult,
 )
+from powercontext.builtin.artifacts.topic_memory.models import MAX_TOPIC_MEMORY_SEARCH_LIMIT
 from powercontext.builtin.context import BuiltinArtifacts, BuiltinSources
 from powercontext.builtin.dream.generation import DreamGenerator
 from powercontext.builtin.dream.models import DreamBudget, DreamOperation
@@ -158,7 +159,11 @@ from powercontext.builtin.persistence.supervision import (
     ArtifactProcessingBindingStateRepository,
     ArtifactProcessingLeaseRepository,
 )
-from powercontext.builtin.persistence.tables import ARTIFACT_HEADS_TABLE, SOURCE_JOURNAL_HEADS_TABLE
+from powercontext.builtin.persistence.tables import (
+    ARTIFACT_HEADS_TABLE,
+    SOURCE_JOURNAL_HEADS_TABLE,
+    SOURCE_LIFECYCLE_TABLE,
+)
 from powercontext.builtin.persistence.topic_memory import TopicMemoryRepository
 from powercontext.builtin.persistence.topic_memory_index import NoTopicMemoryIndex, TopicMemoryIndex
 from powercontext.builtin.persistence.topic_memory_management import TopicMemoryManagementWriter
@@ -991,16 +996,52 @@ class RelationalContexts:
             embedding_profile = query_embedding.embedding_profile
         scope = validate_scope_id(scope_id)
         async with self.database.transaction() as connection:
-            return await self.repositories.topic_memories.search(
+            inactive = await self._inactive_topic_artifacts(connection, scope)
+            result = await self.repositories.topic_memories.search(
                 connection,
                 scope,
                 query,
-                limit=limit,
+                limit=min(MAX_TOPIC_MEMORY_SEARCH_LIMIT, max(limit, limit * 4 if inactive else limit)),
                 mode=mode,
                 query_vector=query_vector,
                 embedding_profile=embedding_profile,
                 admission=admission,
             )
+            if inactive:
+                result = result.model_copy(
+                    update={
+                        "hits": tuple(
+                            hit for hit in result.hits if hit.artifact_ref.artifact_id not in inactive
+                        )[:limit]
+                    }
+                )
+            return result
+
+    async def _inactive_topic_artifacts(self, connection: AsyncConnection, scope_id: str) -> frozenset[str]:
+        """Return topic artifact ids hidden by the Scope's lifecycle graph."""
+
+        try:
+            rows = (
+                await connection.execute(
+                    select(SOURCE_LIFECYCLE_TABLE.c.payload).where(
+                        SOURCE_LIFECYCLE_TABLE.c.scope_id == scope_id,
+                        SOURCE_LIFECYCLE_TABLE.c.kind == "topic",
+                        SOURCE_LIFECYCLE_TABLE.c.available.is_(False),
+                    )
+                )
+            ).scalars()
+        except Exception:
+            return frozenset()
+        hidden: set[str] = set()
+        for value in rows:
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                try:
+                    value = json.loads(bytes(value).decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    continue
+            if isinstance(value, dict) and isinstance(value.get("artifact_id"), str):
+                hidden.add(value["artifact_id"])
+        return frozenset(hidden)
 
     async def search_skills(
         self,

@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -28,6 +30,7 @@ from powercontext.builtin.artifacts.memory.models import MemoryCitation, MemoryH
 from powercontext.builtin.artifacts.profile.models import Profile
 from powercontext.builtin.artifacts.topic_memory import TopicMemory, TopicMemorySearchHit
 from powercontext.builtin.runtime.errors import PreparedContextInvariantError
+from powercontext.builtin.runtime.evidence_selection import evidence_candidates
 from powercontext.builtin.runtime.models import PrepareContextRequest, PreparedContext
 from powercontext.builtin.runtime.prepared_code import (
     CodeEvidenceRef,
@@ -93,6 +96,16 @@ class PreparedContextOmissions:
 
 
 @dataclass(frozen=True)
+class MemoryFragment:
+    """One literal span selected from an exact Memory entry version."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+
+
+@dataclass(frozen=True)
 class PreparedContextBuild:
     """Final public context and the exact origins selected to produce it.
 
@@ -106,6 +119,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[MemoryFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -235,6 +249,11 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
+        if request.evidence_selection:
+            return self._build_evidence_selection(
+                request=request,
+                memory_candidates=memory_candidates,
+            )
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
@@ -292,6 +311,81 @@ class PreparedContextBuilder:
             truncated_items=omissions.truncated_items,
             dropped_items=omissions.dropped_items,
             unused_bytes=max(0, request.max_bytes - content_bytes),
+        )
+
+    def _build_evidence_selection(
+        self,
+        *,
+        request: PrepareContextRequest,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select exact Memory slices for the query inside the complete output budget."""
+
+        sources = _evidence_sources(memory_candidates)
+        if not sources:
+            return PreparedContextBuild(context=self.empty(), origins=(), omissions=PreparedContextOmissions())
+        grouped = evidence_candidates(request.query, tuple(source.text for source in sources))
+        flat: list[tuple[float, float, int, int, int]] = []
+        for index, source in enumerate(sources):
+            for candidate in grouped[index]:
+                if candidate.score <= 0 or candidate.start >= candidate.end:
+                    continue
+                flat.append((candidate.score, source.retrieval_score, index, candidate.start, candidate.end))
+        if not flat:
+            return PreparedContextBuild(context=self.empty(), origins=(), omissions=PreparedContextOmissions())
+
+        by_score = sorted(flat, key=lambda item: (-item[0], -item[1], item[2], item[3]))
+        by_density = sorted(
+            flat,
+            key=lambda item: (-item[0] / max(1, item[4] - item[3]), -item[1], item[2], item[3]),
+        )
+        best_choice: list[list[tuple[int, int, float]]] | None = None
+        best_key = (-1.0, -1)
+        for order in (by_score, by_density):
+            choice: list[list[tuple[int, int, float]]] = [[] for _ in sources]
+            for score, _retrieval, index, start, end in order:
+                trial = _integrate_span(choice, index, start, end, score)
+                if trial is None:
+                    continue
+                fragments = _materialize_evidence(sources, trial)
+                if fragments and _evidence_utf8_len(fragments) <= request.max_bytes:
+                    choice = trial
+            value = sum(score for spans in choice for _start, _end, score in spans)
+            covered = sum(end - start for spans in choice for start, end, _score in spans)
+            key = (value, covered)
+            if key > best_key:
+                best_key = key
+                best_choice = choice
+
+        choice = best_choice or [[] for _ in sources]
+        fragments = _materialize_evidence(sources, choice)
+        fragments = _shrink_evidence(sources, choice, fragments, request.max_bytes)
+        if not fragments:
+            fragments = _prefix_evidence(sources, flat, request.max_bytes)
+        if not fragments:
+            dropped = len(flat)
+            return PreparedContextBuild(
+                context=self.empty(),
+                origins=(),
+                omissions=PreparedContextOmissions(
+                    dropped_items=dropped,
+                    dropped_no_fitting_truncation=dropped,
+                ),
+            )
+        content = _render_evidence(fragments)
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > request.max_bytes:
+            raise PreparedContextInvariantError("output-budget")
+        kept = sum(len(spans) for spans in choice) if fragments else 0
+        dropped = max(0, len(flat) - kept)
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
+            origins=tuple(fragment.address for fragment in fragments),
+            omissions=PreparedContextOmissions(
+                dropped_items=dropped,
+                dropped_no_fitting_truncation=dropped,
+            ),
+            fragments=tuple(fragments),
         )
 
     def _select_entries(
@@ -728,3 +822,483 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
     prefix_budget = byte_budget - len(_ELLIPSIS.encode("utf-8"))
     encoded_prefix = text.encode("utf-8")[:prefix_budget]
     return f"{encoded_prefix.decode('utf-8', errors='ignore')}{_ELLIPSIS}"
+
+
+def _render_evidence(fragments: Sequence[MemoryFragment]) -> str:
+    items = []
+    for fragment in fragments:
+        address = fragment.address
+        items.append(
+            {
+                "citation": {
+                    "scope_id": address.memory.scope_id,
+                    "memory_ref": address.memory.artifact.model_dump(mode="json"),
+                    "entry_id": address.entry_id,
+                    "entry_version_id": address.entry_version_id,
+                },
+                "content": fragment.text,
+                "start": fragment.start,
+                "end": fragment.end,
+            }
+        )
+    envelope = {"trust": "untrusted_history", "items": items}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+_SENTENCE_RE = re.compile(r"[^\n.!?。！？]+(?:[.!?。！？]+|$)")
+_QUERY_TOKEN_RE = re.compile(r"[a-z]+|\d+|[\u4e00-\u9fff]")
+_QUERY_STOP = frozenset(
+    "a an and are as at be by did do does for from had has have how in is it its of on or "
+    "that the their there these this to was were what when where which who why will with".split()
+)
+
+
+def _query_tokens(text: str) -> tuple[str, ...]:
+    return tuple(
+        token
+        for token in _QUERY_TOKEN_RE.findall(text.lower())
+        if token not in _QUERY_STOP
+    )
+
+
+def _split_evidence_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for match in _SENTENCE_RE.finditer(text):
+        start, end = match.span()
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if start >= end:
+            continue
+        # Keep long sentences addressable in bounded pieces.
+        while end - start > 400:
+            cut = text.rfind(" ", start + 240, start + 400)
+            if cut <= start:
+                cut = start + 400
+            spans.append((start, cut))
+            start = cut
+            while start < end and text[start].isspace():
+                start += 1
+        if start < end:
+            spans.append((start, end))
+    return spans
+
+
+def _select_evidence_fragments(
+    *,
+    query: str,
+    memory_candidates: Sequence[PreparedMemoryCandidates],
+    max_bytes: int,
+) -> list[MemoryFragment]:
+    entries: list[tuple[MemoryEntryAddress, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for group in memory_candidates:
+        memory_ref = group.memory_ref
+        if memory_ref is None:
+            continue
+        for hit in group.hits:
+            key = (group.scope_id, hit.entry_id, hit.entry_version_id)
+            if key in seen or not hit.text.strip():
+                continue
+            seen.add(key)
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=group.scope_id, artifact=memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+            entries.append((address, hit.text))
+    if not entries:
+        return []
+
+    query_terms = _query_tokens(query)
+    term_set = set(query_terms)
+    document_frequency: dict[str, int] = {}
+    for _address, text in entries:
+        present = set(_query_tokens(text))
+        for term in term_set & present:
+            document_frequency[term] = document_frequency.get(term, 0) + 1
+    weights = {
+        term: 1.0 + math.log(1.0 + (len(entries) + 1.0) / (document_frequency.get(term, 0) + 1.0))
+        for term in term_set
+    }
+
+    spans: list[tuple[float, int, int, MemoryEntryAddress, int, int]] = []
+    order = 0
+    doc_strength: list[float] = []
+    for doc_index, (address, text) in enumerate(entries):
+        text_lower = text.lower()
+        doc_spans: list[tuple[float, int, int]] = []
+        rank_bonus = 0.08 * (1.0 - doc_index / max(len(entries), 1))
+        doc_tokens = set(_query_tokens(text))
+        doc_coverage = len(term_set & doc_tokens) / max(len(term_set), 1)
+        for start, end in _split_evidence_spans(text):
+            content = text[start:end]
+            tokens = _query_tokens(content)
+            present = term_set.intersection(tokens)
+            score = sum(weights[term] for term in present) + 0.15 * len(present) + rank_bonus
+            if " " + query.strip().lower() + " " in f" {text_lower} ":
+                score += 1.5
+            doc_spans.append((score, start, end))
+            if score > 0:
+                spans.append((score, order, doc_index, address, start, end))
+                order += 1
+        doc_spans.sort(reverse=True)
+        strength = sum(item[0] for item in doc_spans[:3])
+        doc_strength.append(strength)
+        # A complete document can cover evidence that straddles sentence boundaries.
+        if max_bytes >= 1600 and strength > 0 and len(text.encode("utf-8")) <= max_bytes - 300:
+            spans.append((strength * 2.0, order, doc_index, address, 0, len(text)))
+            order += 1
+        # Adjacent high-scoring sentences are often one logical evidence span.
+        for (left_score, left_start, left_end), (right_score, right_start, right_end) in zip(
+            doc_spans, doc_spans[1:]
+        ):
+            if abs(left_start - right_end) <= 2 or abs(right_start - left_end) <= 2:
+                start = min(left_start, right_start)
+                end = max(left_end, right_end)
+                spans.append((left_score + right_score * 0.8, order, doc_index, address, start, end))
+                order += 1
+
+    spans.sort(key=lambda item: (-item[0], item[1]))
+    selected: list[tuple[float, MemoryEntryAddress, int, int]] = []
+    for score, _order, _doc, address, start, end in spans:
+        if max_bytes <= 0:
+            break
+        if any(
+            existing_address == address and existing_start <= start and end <= existing_end
+            for _score, existing_address, existing_start, existing_end in selected
+        ):
+            continue
+        text = next(text for item_address, text in entries if item_address == address)
+        fragment = MemoryFragment(address=address, start=start, end=end, text=text[start:end])
+        selected_fragments = [
+            MemoryFragment(a, s, e, next(text for item_address, text in entries if item_address == a)[s:e])
+            for _sc, a, s, e in selected
+        ]
+        rendered = _render_evidence([*selected_fragments, fragment])
+        if len(rendered.encode("utf-8")) > max_bytes:
+            fitted_end = _fit_evidence_end(
+                selected,
+                entries,
+                address,
+                start,
+                end,
+                max_bytes,
+            )
+            if fitted_end is None:
+                continue
+            fragment = MemoryFragment(address=address, start=start, end=fitted_end, text=text[start:fitted_end])
+        selected.append((score, address, fragment.start, fragment.end))
+
+    # Merge adjacent or overlapping pieces in the same entry to avoid duplicate citations.
+    merged: list[tuple[float, MemoryEntryAddress, int, int]] = []
+    for score, address, start, end in sorted(
+        selected,
+        key=lambda item: (
+            item[1].memory.scope_id,
+            item[1].entry_id,
+            item[1].entry_version_id,
+            item[2],
+            item[3],
+        ),
+    ):
+        if merged and merged[-1][1] == address and start <= merged[-1][3] + 80:
+            old_score, old_address, old_start, old_end = merged[-1]
+            merged[-1] = (max(old_score, score), old_address, old_start, max(old_end, end))
+        else:
+            merged.append((score, address, start, end))
+
+    # Try to complete an evidence sentence span with its immediate neighbours;
+    # SciFact-style rationales often span two adjacent sentences.
+    span_cache: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
+    merged.sort(key=lambda item: (-item[0], item[1].entry_id, item[2]))
+    for position, (score, address, start, end) in enumerate(tuple(merged)):
+        item_text = next(t for ia, t in entries if ia == address)
+        key = (address.memory.scope_id, address.entry_id, address.entry_version_id)
+        spans = span_cache.setdefault(key, _split_evidence_spans(item_text))
+        index = next((i for i, (s, e) in enumerate(spans) if s <= start and end <= e), None)
+        if index is None:
+            continue
+        for neighbour_index in (index - 1, index + 1, index - 2, index + 2):
+            if not 0 <= neighbour_index < len(spans):
+                continue
+            ns, ne = spans[neighbour_index]
+            candidate_start = min(start, ns)
+            candidate_end = max(end, ne)
+            trial = list(merged)
+            trial[position] = (score, address, candidate_start, candidate_end)
+            trial_fragments = []
+            for _sc, addr, s, e in trial:
+                text_item = next(t for ia, t in entries if ia == addr)
+                trial_fragments.append(MemoryFragment(address=addr, start=s, end=e, text=text_item[s:e]))
+            if len(_render_evidence(trial_fragments).encode("utf-8")) <= max_bytes:
+                merged = trial
+                start, end = candidate_start, candidate_end
+    merged.sort(key=lambda item: (item[1].memory.scope_id, item[1].entry_id, item[2], item[3]))
+    fragments: list[MemoryFragment] = []
+    for _score, address, start, end in merged:
+        item_text = next(t for ia, t in entries if ia == address)
+        fragments.append(MemoryFragment(address=address, start=start, end=end, text=item_text[start:end]))
+    content = _render_evidence(fragments)
+    while fragments and len(content.encode("utf-8")) > max_bytes:
+        fragments.pop()
+        content = _render_evidence(fragments)
+    return fragments
+
+
+def _fit_evidence_end(
+    selected: Sequence[tuple[float, MemoryEntryAddress, int, int]],
+    entries: Sequence[tuple[MemoryEntryAddress, str]],
+    address: MemoryEntryAddress,
+    start: int,
+    end: int,
+    max_bytes: int,
+) -> int | None:
+    current_text = next(t for ia, t in entries if ia == address)
+    low, high = start + 1, end
+    best: int | None = None
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = MemoryFragment(address=address, start=start, end=middle, text=current_text[start:middle])
+        selected_fragments = [
+            MemoryFragment(a, s, e, next(t for ia, t in entries if ia == a)[s:e])
+            for _sc, a, s, e in selected
+        ]
+        rendered = _render_evidence([*selected_fragments, candidate])
+        if len(rendered.encode("utf-8")) <= max_bytes:
+            best = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+@dataclass(frozen=True)
+class _EvidenceSource:
+    address: MemoryEntryAddress
+    text: str
+    retrieval_score: float
+
+
+def _evidence_sources(memory_candidates: Sequence[PreparedMemoryCandidates]) -> tuple[_EvidenceSource, ...]:
+    sources: list[_EvidenceSource] = []
+    for candidates in memory_candidates:
+        if candidates.hits and candidates.memory_ref is None:
+            raise PreparedContextInvariantError("memory-ref-missing")
+        seen: set[tuple[str, str]] = set()
+        for hit in candidates.hits:
+            if hit.memory_ref != candidates.memory_ref:
+                raise PreparedContextInvariantError("memory-ref-mismatch")
+            identity = (hit.entry_id, hit.entry_version_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if not hit.entry_id.strip() or not hit.entry_version_id.strip() or not hit.text.strip():
+                continue
+            sources.append(
+                _EvidenceSource(
+                    address=MemoryEntryAddress(
+                        memory=ArtifactAddress(scope_id=candidates.scope_id, artifact=hit.memory_ref),
+                        entry_id=hit.entry_id,
+                        entry_version_id=hit.entry_version_id,
+                    ),
+                    text=hit.text,
+                    retrieval_score=float(hit.score),
+                )
+            )
+    return tuple(sources)
+
+
+def _integrate_span(
+    choice: Sequence[Sequence[tuple[int, int, float]]],
+    index: int,
+    start: int,
+    end: int,
+    score: float,
+) -> list[list[tuple[int, int, float]]] | None:
+    current = list(choice[index])
+    covered: list[int] = []
+    for slot, (old_start, old_end, _score) in enumerate(current):
+        if old_start <= start and end <= old_end:
+            return None
+        if start <= old_start and old_end <= end:
+            covered.append(slot)
+    trial = [list(spans) for spans in choice]
+    trial[index] = [span for slot, span in enumerate(current) if slot not in covered]
+    trial[index].append((start, end, score))
+    return trial
+
+
+def _coalesce_spans(text: str, spans: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not spans:
+        return []
+    ordered = sorted(spans)
+    merged: list[tuple[int, int]] = [ordered[0]]
+    for start, end in ordered[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end or not text[prev_end:start].strip():
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    extended: list[tuple[int, int]] = []
+    for slot, (start, end) in enumerate(merged):
+        limit = merged[slot + 1][0] if slot + 1 < len(merged) else len(text)
+        while end < limit and text[end].isspace():
+            end += 1
+        if start < end:
+            extended.append((int(start), int(end)))
+    return extended
+
+
+def _fragments_for(
+    sources: Sequence[_EvidenceSource],
+    spans_per_source: Sequence[Sequence[tuple[int, int]]],
+) -> list[MemoryFragment]:
+    fragments: list[MemoryFragment] = []
+    for source, spans in zip(sources, spans_per_source, strict=True):
+        for start, end in spans:
+            if not (0 <= start < end <= len(source.text)):
+                continue
+            snippet = source.text[start:end]
+            if not snippet.strip():
+                continue
+            fragments.append(
+                MemoryFragment(
+                    address=source.address,
+                    start=int(start),
+                    end=int(end),
+                    text=snippet,
+                )
+            )
+    return fragments
+
+
+def _geometry(
+    sources: Sequence[_EvidenceSource],
+    choice: Sequence[Sequence[tuple[int, int, float]]],
+) -> list[list[tuple[int, int]]]:
+    spans_per_source = [
+        _coalesce_spans(source.text, [(start, end) for start, end, _score in spans])
+        for source, spans in zip(sources, choice, strict=True)
+    ]
+    return _bridge_spans(sources, spans_per_source)
+
+
+def _bridge_spans(
+    sources: Sequence[_EvidenceSource],
+    spans_per_source: Sequence[Sequence[tuple[int, int]]],
+) -> list[list[tuple[int, int]]]:
+    """Join nearby slices when one citation is cheaper than the text between them."""
+
+    current = [list(spans) for spans in spans_per_source]
+    while True:
+        base = _evidence_utf8_len(_fragments_for(sources, current))
+        best: list[list[tuple[int, int]]] | None = None
+        best_len = base
+        for index, spans in enumerate(current):
+            if len(spans) < 2:
+                continue
+            for slot in range(len(spans) - 1):
+                trial = [list(item) for item in current]
+                left = trial[index]
+                trial[index] = left[:slot] + [(left[slot][0], left[slot + 1][1])] + left[slot + 2 :]
+                size = _evidence_utf8_len(_fragments_for(sources, trial))
+                if size < best_len:
+                    best_len = size
+                    best = trial
+        if best is None:
+            return current
+        current = best
+
+
+def _materialize_evidence(
+    sources: Sequence[_EvidenceSource],
+    choice: Sequence[Sequence[tuple[int, int, float]]],
+) -> list[MemoryFragment]:
+    return _fragments_for(sources, _geometry(sources, choice))
+
+
+def _shrink_evidence(
+    sources: Sequence[_EvidenceSource],
+    choice: Sequence[Sequence[tuple[int, int, float]]],
+    fragments: list[MemoryFragment],
+    max_bytes: int,
+) -> list[MemoryFragment]:
+    scored = [
+        (
+            sum(
+                score
+                for start, end, score in choice[index]
+                if start < fragment.end and end > fragment.start and sources[index].address == fragment.address
+            ),
+            fragment,
+        )
+        for index, _source in enumerate(sources)
+        for fragment in fragments
+        if fragment.address == sources[index].address
+    ]
+    unique: list[tuple[float, MemoryFragment]] = []
+    seen: set[tuple[str, str, str, int, int]] = set()
+    for score, fragment in scored:
+        key = (
+            fragment.address.memory.scope_id,
+            fragment.address.entry_id,
+            fragment.address.entry_version_id,
+            fragment.start,
+            fragment.end,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((score, fragment))
+    kept = unique
+    while kept and _evidence_utf8_len([fragment for _score, fragment in kept]) > max_bytes:
+        drop = min(range(len(kept)), key=lambda slot: (kept[slot][0], kept[slot][1].end - kept[slot][1].start))
+        del kept[drop]
+    return [fragment for _score, fragment in kept]
+
+
+def _prefix_evidence(
+    sources: Sequence[_EvidenceSource],
+    flat: Sequence[tuple[float, float, int, int, int]],
+    max_bytes: int,
+) -> list[MemoryFragment]:
+    if not flat:
+        return []
+    _score, _retrieval, index, start, end = max(flat, key=lambda item: (item[0], -item[2], -item[3]))
+    source = sources[index]
+    lower = start + 1
+    upper = end
+    best_end: int | None = None
+    while lower <= upper:
+        middle = (lower + upper) // 2
+        snippet = source.text[start:middle]
+        fragment = MemoryFragment(
+            address=source.address,
+            start=int(start),
+            end=int(middle),
+            text=snippet,
+        )
+        if snippet.strip() and _evidence_utf8_len([fragment]) <= max_bytes:
+            best_end = middle
+            lower = middle + 1
+        else:
+            upper = middle - 1
+    if best_end is None:
+        return []
+    return [
+        MemoryFragment(
+            address=source.address,
+            start=int(start),
+            end=int(best_end),
+            text=source.text[start:best_end],
+        )
+    ]
+
+
+def _evidence_utf8_len(fragments: Sequence[MemoryFragment]) -> int:
+    if not fragments:
+        return 0
+    return len(_render_evidence(fragments).encode("utf-8"))

@@ -74,3 +74,30 @@ class SourceProcessingPendingProvider:
                 if intent is None or intent.dirty_generation == intent.clean_generation:
                     await intents.mark_dirty(connection, scope, self._binding)
         return str(rows[-1][0]) if len(rows) == limit else None
+
+
+async def source_count_scope_filter(
+    connection: AsyncConnection,
+    scope_ids: tuple[str, ...],
+    *,
+    binding_name: str,
+    threshold: int,
+) -> frozenset[str]:
+    """Keep scopes whose journal grew by at least ``threshold`` since the cursor."""
+
+    if not scope_ids:
+        return frozenset()
+    heads = SOURCE_JOURNAL_HEADS_TABLE
+    rows = (
+        await connection.execute(
+            select(heads.c.scope_id, heads.c.position).where(heads.c.scope_id.in_(scope_ids))
+        )
+    ).all()
+    cursors = await SourceCursorRepository().load_many(connection, tuple(scope_id for scope_id, _ in rows), binding_name)
+    eligible: set[str] = set()
+    for scope_id, head in rows:
+        cursor = cursors.get(str(scope_id))
+        consumed = 0 if cursor is None else cursor.cursor.sequence
+        if int(head) - consumed >= threshold:
+            eligible.add(str(scope_id))
+    return frozenset(eligible)

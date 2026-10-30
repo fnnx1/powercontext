@@ -110,6 +110,7 @@ class ArtifactProcessingBinding:
     max_workers: int = 1
     worker_timeout_seconds: float = 600.0
     automatic_processing_interval: timedelta | None = None
+    source_count_threshold: int | None = None
     cron: str | None = None
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
@@ -136,6 +137,10 @@ class ArtifactProcessingBinding:
                 raise ValueError("automatic interval must be positive")  # noqa: TRY003
             if self.cron is not None:
                 raise ValueError("interval and cron cannot both be enabled")  # noqa: TRY003
+        if self.source_count_threshold is not None and (
+            type(self.source_count_threshold) is not int or self.source_count_threshold < 1
+        ):
+            raise ValueError("source_count_threshold must be a positive integer")  # noqa: TRY003
         if self.cron is not None:
             CronTrigger.from_crontab(self.cron, timezone=ZoneInfo(self.timezone))
 
@@ -399,6 +404,8 @@ class _FamilyState:
     reconcile_complete: bool = False
     notification_at_start: int = 0
     discovery_pending: bool = True
+    count_pending: bool = True
+    count_scan: bool = False
     next_schedule_at: float | None = None
     next_discovery_at: float = 0.0
     automatic_next: bool = False
@@ -514,6 +521,8 @@ class ArtifactProcessingSupervisor:
         for name, state in self._families.items():
             if binding_name is None or binding_name == name:
                 state.discovery_pending = True
+                if state.binding.source_count_threshold is not None:
+                    state.count_pending = True
         self._wake.set()
 
     async def close(self) -> None:
@@ -583,6 +592,7 @@ class ArtifactProcessingSupervisor:
         self._status = ArtifactProcessingSupervisorStatus.LEADER
         for state in self._families.values():
             state.discovery_pending = True
+            state.count_pending = True
             state.reconcile_complete = False
             state.reconcile_after = None
         if self._lease_mode == "oceanbase":
@@ -703,19 +713,28 @@ class ArtifactProcessingSupervisor:
         capacity = self._fresh_capacity(state)
         if capacity <= 0:
             return
+        count_only = (
+            binding.source_count_threshold is not None
+            and binding.automatic_processing_interval is None
+            and binding.cron is None
+        )
+        has_schedule = binding.automatic_processing_interval is not None or binding.cron is not None
+        if count_only and not state.count_pending and not state.scan_in_progress:
+            return
         # Publish RAM progress only after the transaction commits. Advancing a
         # page cursor before admit/finish/commit succeeds would skip rolled-back
         # rows on the next discovery pass of this same persisted generation.
         scan_after = state.scan_after
         scan_generation = state.scan_generation
         scan_in_progress = False
+        count_scan = state.count_scan
         next_schedule_at = state.next_schedule_at
         next_discovery_at = state.next_discovery_at
         admitted: list[str] = []
         async with self._database.transaction() as connection:
             await self._leases.require_fence(connection, self._require_current_fence())
             persisted = await self._binding_states.load(connection, binding.binding_name, for_update=True)
-            enabled = binding.automatic_processing_interval is not None or binding.cron is not None
+            enabled = has_schedule or binding.source_count_threshold is not None
             if not enabled:
                 if persisted is not None and persisted.scan_in_progress:
                     await self._binding_states.finish_scan(connection, binding.binding_name)
@@ -725,10 +744,22 @@ class ArtifactProcessingSupervisor:
                 now = await database_utc_now(connection)
                 if persisted is None or not persisted.scan_in_progress:
                     checkpoint = None if persisted is None else persisted.last_schedule_checkpoint_at
-                    due, next_time = _schedule_deadline(binding, checkpoint, now)
+                    time_due, next_time = (
+                        _schedule_deadline(binding, checkpoint, now) if has_schedule else (None, now)
+                    )
+                    start = False
+                    if count_only:
+                        start = state.count_pending
+                        count_scan = start
+                    elif state.count_pending and time_due is None:
+                        start = True
+                        count_scan = True
+                    elif time_due is not None:
+                        start = True
+                        count_scan = False
                     next_schedule_at = asyncio.get_running_loop().time() + max(0, (next_time - now).total_seconds())
-                    if due is not None:
-                        persisted = await self._binding_states.start_scan(connection, binding.binding_name, due)
+                    if start:
+                        persisted = await self._binding_states.start_scan(connection, binding.binding_name, time_due or now)
                         scan_after = 0
                 if persisted is not None and persisted.scan_in_progress:
                     scan_in_progress = True
@@ -752,7 +783,10 @@ class ArtifactProcessingSupervisor:
                         and row.last_auto_scan_generation != persisted.scan_generation
                     )
                     eligible = frozenset(candidates)
-                    if candidates and binding.automatic_scope_filter is not None:
+                    apply_filter = binding.automatic_scope_filter is not None and (
+                        binding.source_count_threshold is None or count_scan
+                    )
+                    if candidates and apply_filter:
                         eligible &= await binding.automatic_scope_filter(connection, candidates)
                     for row in rows:
                         # A full page of ineligible rows still advances discovery;
@@ -768,15 +802,24 @@ class ArtifactProcessingSupervisor:
                     if not scan_in_progress:
                         await self._binding_states.finish_scan(connection, binding.binding_name)
                         scan_after = 0
+                        if state.count_pending:
+                            state.count_pending = False
+                        count_scan = False
                         # Starting a scan established its checkpoint, so a
                         # completed page must not restart the interval here.
-                        _, next_time = _schedule_deadline(binding, persisted.last_schedule_checkpoint_at, now)
-                        next_schedule_at = asyncio.get_running_loop().time() + max(0, (next_time - now).total_seconds())
+                        if count_only:
+                            next_schedule_at = None
+                        else:
+                            _, next_time = _schedule_deadline(binding, persisted.last_schedule_checkpoint_at, now)
+                            next_schedule_at = asyncio.get_running_loop().time() + max(
+                                0, (next_time - now).total_seconds()
+                            )
                     else:
                         next_discovery_at = asyncio.get_running_loop().time() + _DISCOVERY_PAGE_DELAY_SECONDS
         state.scan_after = scan_after
         state.scan_generation = scan_generation
         state.scan_in_progress = scan_in_progress
+        state.count_scan = count_scan
         state.next_schedule_at = next_schedule_at
         state.next_discovery_at = next_discovery_at
         for scope in admitted:
@@ -1143,6 +1186,8 @@ def _schedule_deadline(
         next_time = checkpoint + binding.automatic_processing_interval
         return (now if now >= next_time else None), next_time
     if binding.cron is None:
+        if binding.source_count_threshold is not None:
+            return now, now
         return None, now
     trigger = CronTrigger.from_crontab(binding.cron, timezone=ZoneInfo(binding.timezone))
     first = trigger.get_next_fire_time(None, (checkpoint + timedelta(microseconds=1)).replace(tzinfo=UTC))
