@@ -10,6 +10,7 @@ from datetime import datetime
 
 import pymysql
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 DB = dict(
@@ -23,6 +24,12 @@ DB = dict(
 )
 
 app = FastAPI(title="Memory Tavern companion")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 TEMPLATES = [
     "酒馆的灯芯爆了一下。{action}。柜台后的老人把这件事记进账本，说：{memory_hint}",
