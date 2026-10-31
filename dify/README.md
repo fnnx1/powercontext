@@ -50,12 +50,16 @@ curl -s -X POST http://127.0.0.1:7870/api/story/continue \
 ### 3. Dify
 
 1. 启动 Dify 1.x（自托管或云端均可），在「工作室 → 导入 DSL」选择 `memory-tavern.yml`。
-2. 如果 Dify 跑在 Docker 中，`host.docker.internal` 默认指向宿主机；Linux 上若无法解析，给 Dify 的 api/worker 容器加：
+2. 如果 Dify 跑在 Docker 中，`host.docker.internal` 需要指向宿主机；Linux 上给 Dify 的 `api`、`worker`、`ssrf_proxy`、`agent_ssrf_proxy` 容器加：
    ```yaml
    extra_hosts:
      - "host.docker.internal:host-gateway"
    ```
-   或把 DSL 中 `http://host.docker.internal:7870` 改成 Dify 容器能访问的宿主机地址。
+   并让 SSRF 代理允许宿主机网段（Dify `.env`）：
+   ```bash
+   SSRF_PROXY_ALLOW_PRIVATE_IPS=172.17.0.0/16
+   ```
+   如果仍不可达，把 DSL 中 `http://host.docker.internal:7870` 改成 Dify 容器能访问的宿主机地址。
 3. 该 Workflow **不需要模型服务**：所有叙事由 companion 的确定性模板生成，Dify 只负责输入、HTTP 调用和输出编排；因此没有 API Key 也能完整运行。
 4. 打开应用，输入会话 ID 和行动即可。
 

@@ -33,3 +33,27 @@ GET /api/story/recall?session_id=demo
 - 开始节点：`session_id=demo`，`action=把月亮藏进酒桶`。
 - 再次运行：`session_id=demo`，`action=向老人追问月亮的味道`。
 - 预期第二次 Answer 的 `memory_used=true`，且文本包含上一轮行动。
+
+
+## Dify 实际运行（2026-10-31 09:29 UTC）
+
+在本地 Dify 1.18.0（docker compose）导入 `memory-tavern.yml`，Workflow 运行输入：
+
+```json
+{"session_id":"demo","action":"让酒馆里的钟倒着走"}
+```
+
+执行结果（Dify 事件流）：
+
+```text
+start   succeeded
+story   succeeded  status_code=200
+answer  succeeded
+workflow_finished succeeded
+
+answer: {"session_id":"demo","turn":4,
+         "story":"...你上次说过「向老人追问月亮的味道」，这次它又回来了。",
+         "memory_used":true}
+```
+
+说明：Dify 的 HTTP Request 节点实际调用了 companion；companion 从 seekdb 读取上一轮 `last_action` 并写入本轮，故 `memory_used=true`。Dify 容器通过 `host.docker.internal:7870` 访问 companion，需要按 README 配置 `extra_hosts` 与 `SSRF_PROXY_ALLOW_PRIVATE_IPS`。
