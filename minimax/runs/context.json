@@ -1,0 +1,30 @@
+{
+  "task": "Implement the volume discount for pricing: lines with quantity >= 10 get 10% off before tax, while small quantities and existing tax behaviour stay unchanged.",
+  "documents": [
+    {
+      "kind": "test",
+      "path": "sample_app/tests/test_pricing.py",
+      "content": "import pytest\n\nfrom sample_app.src.pricing import order_total\n\n\ndef test_target_volume_discount_applies_before_tax():\n    lines = [{\"price\": 100.0, \"quantity\": 10}]\n    assert order_total(lines, tax_rate=0.0) == 900.0\n\n\ndef test_target_volume_discount_is_per_line():\n    lines = [\n        {\"price\": 50.0, \"quantity\": 10},\n        {\"price\": 20.0, \"quantity\": 2},\n    ]\n    assert order_total(lines) == 490.0\n\n\ndef test_regression_small_quantity_has_no_discount():\n    assert order_total([{\"price\": 19.99, \"quantity\": 2}]) == 39.98\n\n\ndef test_regression_tax_still_applies():\n    assert order_total([{\"price\": 100.0, \"quantity\": 1}], tax_rate=0.1) == 110.0\n\n\ndef test_regression_empty_order():\n    assert order_total([]) == 0.0\n\n\ndef test_regression_rounding_two_decimals():\n    assert order_total([{\"price\": 0.335, \"quantity\": 1}]) == 0.34\n",
+      "citation": "seekdb://sdd_documents/sample_app/tests/test_pricing.py"
+    },
+    {
+      "kind": "spec",
+      "path": "sample_app/specs/pricing.md",
+      "content": "# Pricing rules\n\n## Base totals\n\n- Each line has a unit `price` and an integer `quantity`.\n- `order_total` sums `price * quantity`, applies `tax_rate`, and rounds to two decimals.\n\n## Volume discount (required change)\n\n- A line with `quantity >= 10` receives a **10% discount** on that line's subtotal.\n- A line with `quantity < 10` receives no discount.\n- The discount applies before tax.\n- The returned value remains rounded to two decimals.\n- Empty orders return `0.0`.\n\n## Compatibility\n\n- Existing callers pass lists of dicts with `price` and `quantity`.\n- Tax behaviour and rounding for small quantities must not change.\n",
+      "citation": "seekdb://sdd_documents/sample_app/specs/pricing.md"
+    },
+    {
+      "kind": "code",
+      "path": "sample_app/src/pricing.py",
+      "content": "\"\"\"Small pricing module used as the business project for the SDD demo.\"\"\"\n\n\ndef order_total(lines, tax_rate=0.0):\n    \"\"\"Return the order total for ``lines`` plus tax.\n\n    Each line is a mapping with ``price`` and ``quantity`` keys.\n    \"\"\"\n    subtotal = 0.0\n    for line in lines:\n        subtotal += float(line[\"price\"]) * int(line[\"quantity\"])\n    return round(subtotal * (1.0 + float(tax_rate)), 2)\n",
+      "citation": "seekdb://sdd_documents/sample_app/src/pricing.py"
+    }
+  ],
+  "required": {
+    "spec": "sample_app/specs/pricing.md",
+    "code": "sample_app/src/pricing.py",
+    "test": "sample_app/tests/test_pricing.py"
+  },
+  "selection": "SELECT kind, path, content FROM sdd_documents WHERE MATCH(content) AGAINST(task)",
+  "context_hash": "62398a254be7b500"
+}

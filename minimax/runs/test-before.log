@@ -1,0 +1,30 @@
+$ python -m pytest -q sample_app/tests
+FF....                                                                   [100%]
+=================================== FAILURES ===================================
+________________ test_target_volume_discount_applies_before_tax ________________
+
+    def test_target_volume_discount_applies_before_tax():
+        lines = [{"price": 100.0, "quantity": 10}]
+>       assert order_total(lines, tax_rate=0.0) == 900.0
+E       AssertionError: assert 1000.0 == 900.0
+E        +  where 1000.0 = order_total([{'price': 100.0, 'quantity': 10}], tax_rate=0.0)
+
+sample_app/tests/test_pricing.py:8: AssertionError
+___________________ test_target_volume_discount_is_per_line ____________________
+
+    def test_target_volume_discount_is_per_line():
+        lines = [
+            {"price": 50.0, "quantity": 10},
+            {"price": 20.0, "quantity": 2},
+        ]
+>       assert order_total(lines) == 490.0
+E       AssertionError: assert 540.0 == 490.0
+E        +  where 540.0 = order_total([{'price': 50.0, 'quantity': 10}, {'price': 20.0, 'quantity': 2}])
+
+sample_app/tests/test_pricing.py:16: AssertionError
+=========================== short test summary info ============================
+FAILED sample_app/tests/test_pricing.py::test_target_volume_discount_applies_before_tax
+FAILED sample_app/tests/test_pricing.py::test_target_volume_discount_is_per_line
+2 failed, 4 passed in 0.01s
+
+exit_code=1

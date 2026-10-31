@@ -1,0 +1,4 @@
+powercontext[builtin]==1.4.1
+pymysql>=1.1
+requests>=2.31
+pytest>=8.0
