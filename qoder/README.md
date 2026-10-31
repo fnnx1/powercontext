@@ -6,6 +6,7 @@
 
 - `site/`：Qoder Sites 发布的静态站点（HTML/CSS/JS）
 - `../dify/companion/`：本地 FastAPI + seekdb 记忆服务（本作品通过公开隧道调用）
+- 线上站点：**https://memory-tavern-dgh96zt163x.qoder.website**
 - 线上 API：`https://yes-efforts-factors-tutorials.trycloudflare.com`（本地 companion 的临时公网地址）
 
 ## 技术结合
@@ -16,7 +17,7 @@
 
 ## 体验
 
-打开 Qoder Sites 地址，输入 `demo` 和「把月亮藏进酒桶」，再输入「向老人追问月亮的味道」。第二段会出现“你上次说过……”，`记忆账本` 也会追加两条。
+打开 https://memory-tavern-dgh96zt163x.qoder.website，输入 `demo` 和「把月亮藏进酒桶」，再输入「向老人追问月亮的味道」。第二段会出现“你上次说过……”，`记忆账本` 也会追加两条。
 
 ## 本地复现
 
