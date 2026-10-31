@@ -1,0 +1,152 @@
+app:
+  description: 记忆酒馆：Dify 编排的互动说书游戏，故事状态由 seekdb 持久化。
+  icon: 🍺
+  icon_background: '#FFEAD5'
+  mode: workflow
+  name: 记忆酒馆
+  use_icon_as_answer_icon: false
+kind: app
+version: 0.1.5
+workflow:
+  environment_variables: []
+  features:
+    file_upload:
+      enabled: false
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods:
+        - local_file
+        - remote_url
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions:
+    - 把月亮藏进酒桶
+    - 向老人追问月亮的味道
+    - 让酒馆里的钟倒着走
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ''
+      voice: ''
+  graph:
+    edges:
+    - data:
+        sourceType: start
+        targetType: http-request
+      id: start-http
+      selected: false
+      source: start
+      sourceHandle: source
+      target: story
+      targetHandle: target
+      type: custom
+    - data:
+        sourceType: http-request
+        targetType: answer
+      id: http-answer
+      selected: false
+      source: story
+      sourceHandle: source
+      target: answer
+      targetHandle: target
+      type: custom
+    nodes:
+    - data:
+        desc: 输入本局会话 ID 和你想对酒馆说的一句话
+        selected: false
+        title: 开始
+        type: start
+        variables:
+        - label: 会话 ID
+          max_length: 64
+          options: []
+          required: true
+          type: text-input
+          variable: session_id
+        - label: 你的行动
+          max_length: 1024
+          options: []
+          required: true
+          type: paragraph
+          variable: action
+      height: 120
+      id: start
+      position:
+        x: 30
+        y: 260
+      positionAbsolute:
+        x: 30
+        y: 260
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        authorization:
+          config: null
+          type: no-auth
+        body:
+          data: '{"session_id":"{{#start.session_id#}}","action":"{{#start.action#}}"}'
+          type: json
+        desc: 调用本地 companion；它从 seekdb 读取并写回故事状态
+        headers: 'Content-Type: application/json'
+        method: post
+        params: ''
+        retry_config:
+          max_retries: 2
+          retry_enabled: true
+          retry_interval: 1000
+        selected: false
+        timeout:
+          max_connect_timeout: 5
+          max_read_timeout: 10
+          max_write_timeout: 10
+        title: 记忆酒馆 · 续写
+        type: http-request
+        url: http://host.docker.internal:7870/api/story/continue
+        variables: []
+      height: 120
+      id: story
+      position:
+        x: 360
+        y: 260
+      positionAbsolute:
+        x: 360
+        y: 260
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    - data:
+        answer: '{{#story.body#}}'
+        desc: 返回 companion 的 JSON（turn、story、memory_used）
+        selected: false
+        title: 酒馆回应
+        type: answer
+        variables: []
+      height: 100
+      id: answer
+      position:
+        x: 690
+        y: 260
+      positionAbsolute:
+        x: 690
+        y: 260
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 244
+    viewport:
+      x: 0
+      y: 0
+      zoom: 1
