@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Memory Tavern · 记忆酒馆</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="grain"></div>
+  <header>
+    <div class="brand">MEMORY TAVERN <span>记忆酒馆</span></div>
+    <div class="status" id="status">connecting…</div>
+  </header>
+  <main>
+    <section class="hero">
+      <p class="eyebrow">A tiny persistent-world story game</p>
+      <h1>你上次说的话，<br /><em>酒馆还记得。</em></h1>
+      <p class="lede">Dify 编排 × seekdb 记忆。每次推门，老人都会提起你上一轮的胡闹。</p>
+      <div class="session">
+        <label>旅人代号 <input id="session" value="demo" maxlength="32" /></label>
+        <button id="reset" class="ghost">换一位旅人</button>
+      </div>
+      <div class="composer">
+        <input id="action" placeholder="例如：把月亮藏进酒桶" maxlength="200" />
+        <button id="tell">说给酒馆听</button>
+      </div>
+      <div class="examples">
+        <button data-action="把月亮藏进酒桶">把月亮藏进酒桶</button>
+        <button data-action="向老人追问月亮的味道">追问月亮的味道</button>
+        <button data-action="让酒馆里的钟倒着走">让钟倒着走</button>
+      </div>
+    </section>
+    <section class="story-card">
+      <div class="card-head"><span>今晚的故事</span><span id="turn">第 0 轮</span></div>
+      <p id="story">推门进来吧，旅人。酒馆的火还没灭。</p>
+      <div class="memory" id="memory">记忆：等待第一句话…</div>
+    </section>
+    <section class="timeline">
+      <h2>记忆账本</h2>
+      <ol id="timeline"><li class="empty">还没有故事。说一句话，让账本开始记。</li></ol>
+    </section>
+  </main>
+  <footer>seekdb × Qoder Sites · 记忆不是提示词，是数据。</footer>
+  <script src="./app.js"></script>
+</body>
+</html>
