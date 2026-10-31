@@ -1,0 +1,21 @@
+StepFun mini knowledge base — local end-to-end run
+Date: 2026-10-31 (Asia/Shanghai)
+Browser: Microsoft Edge 152.0.4191.62, headless, WebGPU available
+Model: Xenova/all-MiniLM-L6-v2, dtype=q8
+seekdb: local seekdb 1.4.0.0 server, MySQL protocol
+
+UI run:
+- Page loaded; badge = "推理后端：WEBGPU · dtype=q8"; status = "模型已加载"
+- Import 4 sample documents: status "已写入 seekdb：4 篇", elapsed 1.07 s
+- Query "支持混合检索的数据库": results rendered in 1.01 s
+- Result scores (computed by seekdb):
+  fts=1.134 distance=1.000 hybrid=0.567  SeekDB 支持本地嵌入式部署与混合检索。
+  fts=0.903 distance=1.055 hybrid=0.439  OceanBase 是一款面向 AI 应用的分布式数据库...
+  fts=0.631 distance=0.710 hybrid=0.369  混合检索同时使用语义向量和关键词倒排索引...
+- The result set includes both FTS and vector candidates from the single seekdb
+  UNION ALL statement; no client-side merging of two result lists.
+
+API smoke:
+- GET /api/health -> {"ok":true,"documents":N,"dimension":384}
+- POST /api/docs -> inserted N
+- POST /api/search -> results with fts_score, distance, hybrid_score

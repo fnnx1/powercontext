@@ -1,0 +1,14 @@
+{
+  "name": "seekdb-stepfun-mini-kb",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser-side embeddings + seekdb hybrid retrieval mini knowledge base",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "mysql2": "^3.14.2"
+  }
+}

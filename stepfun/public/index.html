@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SeekDB × StepFun · 端侧迷你知识库</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header>
+    <h1>端侧迷你知识库</h1>
+    <p>浏览器本地向量化 · seekdb 向量 + 全文混合检索</p>
+    <div id="backend" class="badge">检测推理后端…</div>
+  </header>
+  <main>
+    <section class="card">
+      <h2>1. 导入文本</h2>
+      <textarea id="docs" rows="8" placeholder="每行一篇文档，例如：&#10;OceanBase 是一款分布式数据库。&#10;SeekDB 支持向量与全文混合检索。"></textarea>
+      <div class="row">
+        <button id="import">导入并向量化</button>
+        <button id="sample" class="ghost">填入示例</button>
+        <span id="status"></span>
+      </div>
+    </section>
+    <section class="card">
+      <h2>2. 检索</h2>
+      <div class="row">
+        <input id="query" placeholder="例如：支持混合检索的数据库" />
+        <button id="search">搜索</button>
+      </div>
+      <ol id="results"></ol>
+    </section>
+  </main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
